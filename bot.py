@@ -939,6 +939,71 @@ async def notify_winner_to_owner(
     await context.bot.send_message(chat_id=owner_id, text=text)
 
 
+async def send_visual_gift_message(
+    message,
+    *,
+    sticker_file_id: str,
+    actual_stars: int,
+    gift_id: Any,
+) -> None:
+    await message.reply_document(document=sticker_file_id)
+    await message.reply_text(
+        f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+        "Надіслано як документ."
+    )
+
+
+async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    target_stars = 15
+    if context.args:
+        try:
+            target_stars = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Сума має бути числом. Приклад: /teststicker 25")
+            return
+
+    try:
+        gifts = await get_available_gifts(token)
+    except Exception as err:
+        await message.reply_text(f"Не вдалося отримати подарунки: {err}")
+        return
+
+    gift, actual_stars = pick_gift_by_stars(gifts, target_stars)
+    if not gift or actual_stars is None:
+        await message.reply_text("Не знайдено подарунка для тесту.")
+        return
+
+    sticker_file_id = get_gift_sticker_file_id(gift)
+    if not sticker_file_id:
+        await message.reply_text(f"У gift_id={gift.get('id')} немає sticker.file_id")
+        return
+
+    await send_visual_gift_message(
+        message,
+        sticker_file_id=sticker_file_id,
+        actual_stars=actual_stars,
+        gift_id=gift.get("id"),
+    )
+
+
 def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
     bag = state.remaining_units()
     if not bag:
@@ -1041,7 +1106,12 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
 
-            await message.reply_sticker(sticker=sticker_file_id)
+            await send_visual_gift_message(
+                message,
+                sticker_file_id=sticker_file_id,
+                actual_stars=actual_stars,
+                gift_id=gift.get("id"),
+            )
             save_successful_claim(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -1084,6 +1154,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("gifts", on_gifts, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("teststicker", on_teststicker, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("resetday", on_resetday, filters=filters.ChatType.PRIVATE))
     app.add_handler(PreCheckoutQueryHandler(on_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
