@@ -4,6 +4,7 @@ import os
 import random
 import sqlite3
 import asyncio
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,7 +14,8 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from telegram import LabeledPrice, Update
+from telegram import InputFile, LabeledPrice, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -941,16 +943,52 @@ async def notify_winner_to_owner(
 
 async def send_visual_gift_message(
     message,
+    context: ContextTypes.DEFAULT_TYPE,
     *,
     sticker_file_id: str,
     actual_stars: int,
     gift_id: Any,
 ) -> None:
-    await message.reply_document(document=sticker_file_id)
-    await message.reply_text(
-        f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-        "Надіслано як документ."
-    )
+    try:
+        await message.reply_document(document=sticker_file_id)
+        await message.reply_text(
+            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+            "Надіслано як документ."
+        )
+        return
+    except BadRequest as err:
+        # Some Telegram file_ids are not accepted directly by sendDocument (Document_invalid).
+        # In that case, download by get_file and re-upload as a fresh document.
+        if "Document_invalid" in str(err):
+            try:
+                tg_file = await context.bot.get_file(sticker_file_id)
+                file_bytes = BytesIO()
+                await tg_file.download_to_memory(out=file_bytes)
+                file_bytes.seek(0)
+                filename = tg_file.file_path.split("/")[-1] if tg_file.file_path else f"gift_{gift_id}.tgs"
+                await message.reply_document(document=InputFile(file_bytes, filename=filename))
+                await message.reply_text(
+                    f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+                    "Надіслано як документ (через re-upload)."
+                )
+                return
+            except Exception as nested_err:
+                await message.reply_text(
+                    f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+                    f"Не вдалося навіть після завантаження файла: {nested_err}. Показую текстом."
+                )
+                return
+        await message.reply_text(
+            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+            f"Telegram не дозволив надіслати файл ({err}). Показую текстом."
+        )
+        return
+    except Exception as err:
+        await message.reply_text(
+            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
+            f"Помилка відправки файла: {err}. Показую текстом."
+        )
+        return
 
 
 async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -998,6 +1036,7 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await send_visual_gift_message(
         message,
+        context,
         sticker_file_id=sticker_file_id,
         actual_stars=actual_stars,
         gift_id=gift.get("id"),
@@ -1108,6 +1147,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             await send_visual_gift_message(
                 message,
+                context,
                 sticker_file_id=sticker_file_id,
                 actual_stars=actual_stars,
                 gift_id=gift.get("id"),
