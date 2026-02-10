@@ -249,6 +249,11 @@ def set_setting(key: str, value: str) -> None:
         conn.commit()
 
 
+def set_topup_status(status: str, details: str = "") -> None:
+    set_setting("topup_status", status)
+    set_setting("topup_details", details[:1000])
+
+
 def should_send_daily_limit_notice(chat_id: int, day_key: str, cooldown_min: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -445,6 +450,7 @@ async def transfer_business_account_stars(token: str, business_connection_id: st
 
 async def maybe_auto_topup(token: str) -> None:
     if not parse_bool_env("AUTO_TOPUP_ENABLED", True):
+        set_topup_status("disabled", "AUTO_TOPUP_ENABLED=0")
         return
 
     threshold_raw = os.getenv("AUTO_TOPUP_THRESHOLD", str(DEFAULT_AUTO_TOPUP_THRESHOLD))
@@ -460,19 +466,30 @@ async def maybe_auto_topup(token: str) -> None:
 
     balance = await get_my_star_balance(token)
     if balance >= threshold:
+        set_topup_status("ok", f"balance={balance} >= threshold={threshold}")
         return
 
     business_connection_id = resolve_business_connection_id()
     if not business_connection_id:
         logger.warning("Auto top-up skipped: BUSINESS_CONNECTION_ID is unknown")
+        set_topup_status("skipped", "BUSINESS_CONNECTION_ID is unknown")
         return
 
-    await transfer_business_account_stars(token, business_connection_id, transfer_amount)
-    logger.info(
-        "Auto top-up completed: transferred %s Stars, previous balance was %s",
-        transfer_amount,
-        balance,
-    )
+    try:
+        await transfer_business_account_stars(token, business_connection_id, transfer_amount)
+        logger.info(
+            "Auto top-up completed: transferred %s Stars, previous balance was %s",
+            transfer_amount,
+            balance,
+        )
+        set_topup_status("ok", f"transferred={transfer_amount}, previous_balance={balance}")
+    except Exception as err:
+        err_text = str(err)
+        if "BOT_ACCESS_FORBIDDEN" in err_text:
+            set_topup_status("forbidden", err_text)
+        else:
+            set_topup_status("error", err_text)
+        raise
 
 
 def capture_business_connection_id(update: Update) -> str | None:
@@ -540,6 +557,8 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     auto_enabled = parse_bool_env("AUTO_TOPUP_ENABLED", True)
     threshold = os.getenv("AUTO_TOPUP_THRESHOLD", str(DEFAULT_AUTO_TOPUP_THRESHOLD))
     amount = os.getenv("AUTO_TOPUP_AMOUNT", str(DEFAULT_AUTO_TOPUP_AMOUNT))
+    topup_status = get_setting("topup_status") or "unknown"
+    topup_details = get_setting("topup_details") or "-"
 
     try:
         balance = await get_my_star_balance(token)
@@ -554,6 +573,8 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"- AUTO_TOPUP_THRESHOLD: {threshold}",
         f"- AUTO_TOPUP_AMOUNT: {amount}",
         f"- business_connection_id: {business_connection_id}",
+        f"- TopUp status: {topup_status}",
+        f"- TopUp details: {topup_details}",
         f"- Місяць: {month_key}",
         f"- День: {day_key}",
     ]
@@ -625,11 +646,17 @@ async def on_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         before_balance = await get_my_star_balance(token)
         await transfer_business_account_stars(token, business_connection_id, amount)
         after_balance = await get_my_star_balance(token)
+        set_topup_status("ok", f"manual_transfer={amount}, before={before_balance}, after={after_balance}")
         await message.reply_text(
             f"Поповнення виконано: +{amount} Stars.\n"
             f"Баланс був: {before_balance}, став: {after_balance}."
         )
     except Exception as err:
+        err_text = str(err)
+        if "BOT_ACCESS_FORBIDDEN" in err_text:
+            set_topup_status("forbidden", err_text)
+        else:
+            set_topup_status("error", err_text)
         await message.reply_text(f"Не вдалося поповнити Stars: {err}")
 
 
