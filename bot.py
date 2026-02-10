@@ -317,6 +317,23 @@ def resolve_business_connection_id() -> str | None:
     return get_setting("business_connection_id")
 
 
+def resolve_stats_owner_user_id() -> int | None:
+    owner_id_raw = os.getenv("STATS_OWNER_USER_ID", "").strip()
+    if not owner_id_raw:
+        return None
+    try:
+        return int(owner_id_raw)
+    except ValueError:
+        return None
+
+
+def is_stats_owner(user_id: int) -> bool:
+    owner_id = resolve_stats_owner_user_id()
+    if owner_id is None:
+        return True
+    return user_id == owner_id
+
+
 def save_successful_claim(
     chat_id: int,
     user_id: int,
@@ -506,15 +523,11 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
 
-    owner_id_raw = os.getenv("STATS_OWNER_USER_ID", "").strip()
-    if owner_id_raw:
-        try:
-            owner_id = int(owner_id_raw)
-        except ValueError:
-            await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
-            return
-        if user.id != owner_id:
-            return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
 
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -566,6 +579,58 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     await message.reply_text("\n".join(lines))
+
+
+async def on_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    business_connection_id = resolve_business_connection_id()
+    if not business_connection_id:
+        await message.reply_text("Не знайдено business_connection_id. Підключи бізнес-бота або задай BUSINESS_CONNECTION_ID.")
+        return
+
+    if context.args:
+        amount_raw = context.args[0]
+    else:
+        amount_raw = os.getenv("AUTO_TOPUP_AMOUNT", str(DEFAULT_AUTO_TOPUP_AMOUNT))
+
+    try:
+        amount = int(amount_raw)
+    except ValueError:
+        await message.reply_text("Сума має бути числом. Приклад: /topup 615")
+        return
+
+    if amount < 1 or amount > 10000:
+        await message.reply_text("Сума має бути в діапазоні 1..10000.")
+        return
+
+    try:
+        before_balance = await get_my_star_balance(token)
+        await transfer_business_account_stars(token, business_connection_id, amount)
+        after_balance = await get_my_star_balance(token)
+        await message.reply_text(
+            f"Поповнення виконано: +{amount} Stars.\n"
+            f"Баланс був: {before_balance}, став: {after_balance}."
+        )
+    except Exception as err:
+        await message.reply_text(f"Не вдалося поповнити Stars: {err}")
 
 
 def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
@@ -687,6 +752,7 @@ def build_app() -> Application:
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(TypeHandler(Update, on_any_update, block=False), group=-1)
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & filters.Dice.SLOT_MACHINE,
