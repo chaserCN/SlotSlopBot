@@ -1043,8 +1043,8 @@ async def deliver_gift_like_win(
             logger.exception("Failed to notify owner about winner: %s", err)
 
     await message.reply_text(
-        f"Візуальний подарунок показано в чаті: {actual_stars} Stars.\n"
-        f"Сьогодні вибив(ла) {winner_name} зі спроби #{attempt_no}."
+        f"Вітаємо! {winner_name} виграв щоденний приз з #{attempt_no} спроби! "
+        f"Випав приз за {actual_stars} Stars 🎉"
     )
     return True
 
