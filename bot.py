@@ -26,11 +26,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Monthly quotas per group for exactly 30 gifts: 3x50, 6x25, 21x15.
+# Monthly quotas per group for up to 31 gifts: 3x50, 6x25, 22x15.
 MONTHLY_QUOTAS = {
     50: 3,
     25: 6,
-    15: 21,
+    15: 22,
 }
 
 DEFAULT_FALLBACK_TEXT = "Сьогодні не вдалося надіслати подарунок, але удача на твоєму боці."
