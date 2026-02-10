@@ -41,13 +41,11 @@ MONTHLY_QUOTAS = {
     15: 22,
 }
 
-DEFAULT_FALLBACK_TEXT = "Сьогодні не вдалося надіслати подарунок, але удача на твоєму боці."
 DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт уже вичерпано: у цій групі вже видали 1 подарунок."
 DEFAULT_MONTHLY_LIMIT_TEXT = "Місячний ліміт подарунків для цієї групи вже вичерпано."
 DEFAULT_DAILY_NOTICE_COOLDOWN_MIN = 10
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
-DEFAULT_GIFT_SELLABLE_ONLY = True
 DB_PATH = Path(os.getenv("DB_PATH", "gift_state.sqlite3"))
 API_BASE = "https://api.telegram.org"
 CLAIM_LOCK = asyncio.Lock()
@@ -77,6 +75,7 @@ class DailyClaim:
     user_id: int
     winner_name: str
     attempt_no: int
+    claimed_stars: int
 
 
 def init_db() -> None:
@@ -89,17 +88,12 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 winner_name TEXT NOT NULL DEFAULT '',
                 attempt_no INTEGER NOT NULL DEFAULT 0,
+                claimed_stars INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (chat_id, day_key)
             )
             """
         )
-        # Lightweight migration for existing DBs created before winner_name/attempt_no fields.
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(daily_claims)").fetchall()]
-        if "winner_name" not in cols:
-            conn.execute("ALTER TABLE daily_claims ADD COLUMN winner_name TEXT NOT NULL DEFAULT ''")
-        if "attempt_no" not in cols:
-            conn.execute("ALTER TABLE daily_claims ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_attempts (
@@ -161,7 +155,7 @@ def get_daily_claim(chat_id: int, day_key: str) -> DailyClaim | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
-            SELECT user_id, winner_name, attempt_no
+            SELECT user_id, winner_name, attempt_no, claimed_stars
             FROM daily_claims
             WHERE chat_id = ? AND day_key = ?
             """,
@@ -169,7 +163,62 @@ def get_daily_claim(chat_id: int, day_key: str) -> DailyClaim | None:
         ).fetchone()
     if not row:
         return None
-    return DailyClaim(user_id=row[0], winner_name=row[1], attempt_no=row[2])
+    return DailyClaim(user_id=row[0], winner_name=row[1], attempt_no=row[2], claimed_stars=row[3])
+
+
+def reset_daily_claim(chat_id: int, day_key: str, month_key: str) -> tuple[bool, int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT claimed_stars
+            FROM daily_claims
+            WHERE chat_id = ? AND day_key = ?
+            """,
+            (chat_id, day_key),
+        ).fetchone()
+        if not row:
+            return False, 0
+
+        claimed_stars = row[0] if isinstance(row[0], int) else 0
+        conn.execute(
+            "DELETE FROM daily_claims WHERE chat_id = ? AND day_key = ?",
+            (chat_id, day_key),
+        )
+        conn.execute(
+            "DELETE FROM daily_limit_notices WHERE chat_id = ? AND day_key = ?",
+            (chat_id, day_key),
+        )
+
+        if claimed_stars == 50:
+            conn.execute(
+                """
+                UPDATE monthly_claims
+                SET sent_50 = CASE WHEN sent_50 > 0 THEN sent_50 - 1 ELSE 0 END
+                WHERE chat_id = ? AND month_key = ?
+                """,
+                (chat_id, month_key),
+            )
+        elif claimed_stars == 25:
+            conn.execute(
+                """
+                UPDATE monthly_claims
+                SET sent_25 = CASE WHEN sent_25 > 0 THEN sent_25 - 1 ELSE 0 END
+                WHERE chat_id = ? AND month_key = ?
+                """,
+                (chat_id, month_key),
+            )
+        elif claimed_stars == 15:
+            conn.execute(
+                """
+                UPDATE monthly_claims
+                SET sent_15 = CASE WHEN sent_15 > 0 THEN sent_15 - 1 ELSE 0 END
+                WHERE chat_id = ? AND month_key = ?
+                """,
+                (chat_id, month_key),
+            )
+
+        conn.commit()
+    return True, claimed_stars
 
 
 def increment_daily_attempt(chat_id: int, day_key: str) -> int:
@@ -324,6 +373,12 @@ def is_chat_allowed(chat_id: int) -> bool:
     return chat_id in allowed
 
 
+def is_slot_allowed_context(chat_type: str, chat_id: int, user_id: int) -> bool:
+    if chat_type == "private":
+        return is_stats_owner(user_id)
+    return is_chat_allowed(chat_id)
+
+
 def resolve_business_connection_id() -> str | None:
     env_value = os.getenv("BUSINESS_CONNECTION_ID")
     if env_value:
@@ -388,10 +443,12 @@ def save_successful_claim(
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO daily_claims (chat_id, day_key, user_id, winner_name, attempt_no, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO daily_claims (
+                chat_id, day_key, user_id, winner_name, attempt_no, claimed_stars, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_id, day_key, user_id, winner_name, attempt_no, datetime.now(timezone.utc).isoformat()),
+            (chat_id, day_key, user_id, winner_name, attempt_no, stars, datetime.now(timezone.utc).isoformat()),
         )
         conn.execute(
             """
@@ -775,6 +832,62 @@ async def on_gifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(text)
 
 
+async def on_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    allowed = sorted(allowed_chat_ids())
+    target_chat_id: int | None = None
+    target_day_key: str | None = None
+
+    if context.args:
+        try:
+            target_chat_id = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Невірний chat_id. Приклад: /resetday -1001234567890")
+            return
+        if len(context.args) > 1:
+            target_day_key = context.args[1]
+            try:
+                datetime.strptime(target_day_key, "%Y-%m-%d")
+            except ValueError:
+                await message.reply_text("Невірна дата. Формат: YYYY-MM-DD")
+                return
+    elif len(allowed) == 1:
+        target_chat_id = allowed[0]
+    else:
+        await message.reply_text("Вкажи chat_id: /resetday -1001234567890")
+        return
+
+    if target_chat_id not in allowed:
+        await message.reply_text("Цей chat_id не входить до ALLOWED_CHAT_IDS.")
+        return
+
+    if not target_day_key:
+        target_day_key, _ = current_keys()
+    target_month_key = target_day_key[:7]
+
+    removed, claimed_stars = reset_daily_claim(target_chat_id, target_day_key, target_month_key)
+    if not removed:
+        await message.reply_text(f"На {target_day_key} для чату {target_chat_id} прапорця переможця не було.")
+        return
+
+    await message.reply_text(
+        f"Скинуто денний прапорець для чату {target_chat_id} на {target_day_key}.\n"
+        f"Місячний лічильник відкотили на категорію: {claimed_stars} Stars."
+    )
+
+
 async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
     if not query:
@@ -836,15 +949,12 @@ def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
 def pick_gift_by_stars(
     gifts: list[dict[str, Any]],
     target_stars: int,
-    sellable_only: bool,
 ) -> tuple[dict[str, Any] | None, int | None]:
     # Prefer exact tier, then lower tier, so budget is never accidentally exceeded.
     for stars in [target_stars, 25, 15]:
         if stars > target_stars:
             continue
         candidates = [gift for gift in gifts if gift.get("star_count") == stars]
-        if sellable_only:
-            candidates = [gift for gift in candidates if is_sellable_gift(gift)]
         if candidates:
             return random.choice(candidates), stars
     return None, None
@@ -864,8 +974,8 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = chat.id
     user_id = user.id
 
-    # Additional guard: work only in explicitly whitelisted groups.
-    if not is_chat_allowed(chat_id):
+    # In groups: whitelist only. In private: only STATS_OWNER_USER_ID.
+    if not is_slot_allowed_context(chat.type, chat_id, user_id):
         return
 
     token = os.getenv("BOT_TOKEN")
@@ -873,7 +983,6 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("BOT_TOKEN is missing")
         return
 
-    fallback_text = os.getenv("FALLBACK_TEXT", DEFAULT_FALLBACK_TEXT)
     winner_name = user.full_name or "Переможець"
     daily_limit_text = os.getenv("DAILY_LIMIT_TEXT", DEFAULT_DAILY_LIMIT_TEXT)
     monthly_limit_text = os.getenv("MONTHLY_LIMIT_TEXT", DEFAULT_MONTHLY_LIMIT_TEXT)
@@ -882,7 +991,6 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         daily_notice_cooldown_min = max(1, int(cooldown_min_raw))
     except ValueError:
         daily_notice_cooldown_min = DEFAULT_DAILY_NOTICE_COOLDOWN_MIN
-    sellable_only = parse_bool_env("GIFT_SELLABLE_ONLY", DEFAULT_GIFT_SELLABLE_ONLY)
 
     async with CLAIM_LOCK:
         current_attempt_no = increment_daily_attempt(chat_id, day_key)
@@ -910,15 +1018,27 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         try:
-            gifts = await get_available_gifts(token)
-            gift, actual_stars = pick_gift_by_stars(gifts, stars_tier, sellable_only=sellable_only)
+            try:
+                gifts = await get_available_gifts(token)
+            except Exception as err:
+                await message.reply_text(f"Помилка Telegram API (getAvailableGifts): {err}")
+                return
+
+            gift, actual_stars = pick_gift_by_stars(gifts, stars_tier)
             if not gift or actual_stars is None:
-                await message.reply_text(fallback_text)
+                await message.reply_text(
+                    f"Немає доступного подарунка для категорії {stars_tier} Stars "
+                    f"(або нижчих 25/15, якщо дозволено fallback)."
+                )
                 return
 
             sticker_file_id = get_gift_sticker_file_id(gift)
             if not sticker_file_id:
-                await message.reply_text(fallback_text)
+                gift_id = gift.get("id")
+                await message.reply_text(
+                    f"Подарунок знайдено, але без sticker.file_id (gift_id={gift_id}). "
+                    "Тому показую текстом: виграшний тип подарунка визначено."
+                )
                 return
 
             await message.reply_sticker(sticker=sticker_file_id)
@@ -949,7 +1069,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as err:
             logger.exception("Failed to send gift: %s", err)
-            await message.reply_text(fallback_text)
+            await message.reply_text(f"Помилка під час обробки подарунка: {err}")
 
 
 def build_app() -> Application:
@@ -964,11 +1084,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("gifts", on_gifts, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("resetday", on_resetday, filters=filters.ChatType.PRIVATE))
     app.add_handler(PreCheckoutQueryHandler(on_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS & filters.Dice.SLOT_MACHINE,
+            (filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Dice.SLOT_MACHINE,
             on_slot,
         )
     )
