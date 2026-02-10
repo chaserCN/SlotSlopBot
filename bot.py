@@ -47,6 +47,7 @@ DEFAULT_MONTHLY_LIMIT_TEXT = "Місячний ліміт подарунків �
 DEFAULT_DAILY_NOTICE_COOLDOWN_MIN = 10
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
+DEFAULT_GIFT_SELLABLE_ONLY = True
 DB_PATH = Path(os.getenv("DB_PATH", "gift_state.sqlite3"))
 API_BASE = "https://api.telegram.org"
 CLAIM_LOCK = asyncio.Lock()
@@ -345,6 +346,24 @@ def is_stats_owner(user_id: int) -> bool:
     if owner_id is None:
         return True
     return user_id == owner_id
+
+
+def get_gift_convert_value(gift: dict[str, Any]) -> int:
+    for key in ("convert_star_count", "convert_stars", "resale_star_count"):
+        value = gift.get(key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def is_sellable_gift(gift: dict[str, Any]) -> bool:
+    if get_gift_convert_value(gift) > 0:
+        return True
+    for key in ("can_be_converted_to_stars", "can_be_sold", "sellable"):
+        value = gift.get(key)
+        if isinstance(value, bool) and value:
+            return True
+    return False
 
 
 def save_successful_claim(
@@ -709,6 +728,52 @@ async def on_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def on_gifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    try:
+        gifts = await get_available_gifts(token)
+    except Exception as err:
+        await message.reply_text(f"Не вдалося отримати подарунки: {err}")
+        return
+
+    if not gifts:
+        await message.reply_text("Доступних подарунків зараз немає.")
+        return
+
+    lines = [f"Доступні подарунки: {len(gifts)}", "Режим /gifts: показує всі подарунки (без фільтра)"]
+    for gift in sorted(gifts, key=lambda g: (g.get("star_count", 0), str(g.get("id", "")))):
+        gift_id = gift.get("id")
+        stars = gift.get("star_count")
+        convert_value = get_gift_convert_value(gift)
+        sellable = is_sellable_gift(gift)
+        sold_out = gift.get("is_sold_out")
+        lines.append(
+            f"- id={gift_id} stars={stars} convert={convert_value} sellable={1 if sellable else 0} sold_out={1 if sold_out else 0}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        text = text[:3500] + "\n...обрізано"
+    await message.reply_text(text)
+
+
 async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
     if not query:
@@ -732,12 +797,18 @@ def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
     return random.choice(bag)
 
 
-def pick_gift_by_stars(gifts: list[dict[str, Any]], target_stars: int) -> tuple[dict[str, Any] | None, int | None]:
+def pick_gift_by_stars(
+    gifts: list[dict[str, Any]],
+    target_stars: int,
+    sellable_only: bool,
+) -> tuple[dict[str, Any] | None, int | None]:
     # Prefer exact tier, then lower tier, so budget is never accidentally exceeded.
     for stars in [target_stars, 25, 15]:
         if stars > target_stars:
             continue
         candidates = [gift for gift in gifts if gift.get("star_count") == stars]
+        if sellable_only:
+            candidates = [gift for gift in candidates if is_sellable_gift(gift)]
         if candidates:
             return random.choice(candidates), stars
     return None, None
@@ -775,6 +846,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         daily_notice_cooldown_min = max(1, int(cooldown_min_raw))
     except ValueError:
         daily_notice_cooldown_min = DEFAULT_DAILY_NOTICE_COOLDOWN_MIN
+    sellable_only = parse_bool_env("GIFT_SELLABLE_ONLY", DEFAULT_GIFT_SELLABLE_ONLY)
 
     async with CLAIM_LOCK:
         current_attempt_no = increment_daily_attempt(chat_id, day_key)
@@ -804,7 +876,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await maybe_auto_topup(token)
             gifts = await get_available_gifts(token)
-            gift, actual_stars = pick_gift_by_stars(gifts, stars_tier)
+            gift, actual_stars = pick_gift_by_stars(gifts, stars_tier, sellable_only=sellable_only)
             if not gift or actual_stars is None:
                 await message.reply_text(fallback_text)
                 return
@@ -846,6 +918,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("gifts", on_gifts, filters=filters.ChatType.PRIVATE))
     app.add_handler(PreCheckoutQueryHandler(on_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
     app.add_handler(
