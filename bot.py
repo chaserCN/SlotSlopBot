@@ -356,6 +356,16 @@ def get_gift_convert_value(gift: dict[str, Any]) -> int:
     return 0
 
 
+def get_gift_sticker_file_id(gift: dict[str, Any]) -> str | None:
+    sticker = gift.get("sticker")
+    if not isinstance(sticker, dict):
+        return None
+    file_id = sticker.get("file_id")
+    if isinstance(file_id, str) and file_id:
+        return file_id
+    return None
+
+
 def is_sellable_gift(gift: dict[str, Any]) -> bool:
     if get_gift_convert_value(gift) > 0:
         return True
@@ -448,15 +458,6 @@ def _api_call(token: str, method: str, payload: dict[str, Any] | None = None) ->
 async def get_available_gifts(token: str) -> list[dict[str, Any]]:
     result = await asyncio.to_thread(_api_call, token, "getAvailableGifts")
     return result.get("gifts", [])
-
-
-async def send_gift(token: str, user_id: int, gift_id: str, text: str) -> dict[str, Any]:
-    payload = {
-        "user_id": user_id,
-        "gift_id": gift_id,
-        "text": text,
-    }
-    return await asyncio.to_thread(_api_call, token, "sendGift", payload)
 
 
 async def get_my_star_balance(token: str) -> int:
@@ -790,6 +791,41 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
     await message.reply_text(f"Платіж успішний: {amount} {currency}. Stars зарахуються на баланс бота.")
 
 
+async def notify_winner_to_owner(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    winner_name: str,
+    winner_user_id: int,
+    attempt_no: int,
+    stars_tier: int,
+    gift: dict[str, Any],
+) -> None:
+    if not parse_bool_env("WINNER_NOTIFY_ENABLED", True):
+        return
+
+    owner_id = resolve_stats_owner_user_id()
+    if owner_id is None:
+        return
+
+    gift_id = gift.get("id")
+    sellable = 1 if is_sellable_gift(gift) else 0
+    user_link = f"tg://user?id={winner_user_id}"
+    day_key, month_key = current_keys()
+    text = (
+        "Переможець дня\n"
+        f"- Група: {chat_id}\n"
+        f"- Користувач: {winner_name}\n"
+        f"- Link: {user_link}\n"
+        f"- Спроба: #{attempt_no}\n"
+        f"- Тип подарунка: {stars_tier} Stars\n"
+        f"- gift_id: {gift_id}\n"
+        f"- sellable: {sellable}\n"
+        f"- День/місяць: {day_key} / {month_key}"
+    )
+    await context.bot.send_message(chat_id=owner_id, text=text)
+
+
 def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
     bag = state.remaining_units()
     if not bag:
@@ -874,21 +910,18 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         try:
-            await maybe_auto_topup(token)
             gifts = await get_available_gifts(token)
             gift, actual_stars = pick_gift_by_stars(gifts, stars_tier, sellable_only=sellable_only)
             if not gift or actual_stars is None:
                 await message.reply_text(fallback_text)
                 return
 
-            gift_id = gift.get("id")
-            if not gift_id:
+            sticker_file_id = get_gift_sticker_file_id(gift)
+            if not sticker_file_id:
                 await message.reply_text(fallback_text)
                 return
 
-            congrats_text = f"{winner_name}, виграш за 777: подарунок на {actual_stars} Stars."
-            await send_gift(token, user_id, gift_id, congrats_text)
-            await maybe_auto_topup(token)
+            await message.reply_sticker(sticker=sticker_file_id)
             save_successful_claim(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -898,8 +931,20 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 month_key=month_key,
                 stars=actual_stars,
             )
+            try:
+                await notify_winner_to_owner(
+                    context,
+                    chat_id=chat_id,
+                    winner_name=winner_name,
+                    winner_user_id=user_id,
+                    attempt_no=current_attempt_no,
+                    stars_tier=actual_stars,
+                    gift=gift,
+                )
+            except Exception as err:
+                logger.exception("Failed to notify owner about winner: %s", err)
             await message.reply_text(
-                f"Подарунок надіслано: {actual_stars} Stars.\n"
+                f"Візуальний подарунок показано в чаті: {actual_stars} Stars.\n"
                 f"Сьогодні вибив(ла) {winner_name} зі спроби #{current_attempt_no}."
             )
         except Exception as err:
