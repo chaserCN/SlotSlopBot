@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
 load_dotenv()
 
@@ -190,6 +190,21 @@ def increment_daily_attempt(chat_id: int, day_key: str) -> int:
             (chat_id, day_key),
         ).fetchone()
         conn.commit()
+    if not row:
+        return 0
+    return row[0]
+
+
+def get_daily_attempt(chat_id: int, day_key: str) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT attempts
+            FROM daily_attempts
+            WHERE chat_id = ? AND day_key = ?
+            """,
+            (chat_id, day_key),
+        ).fetchone()
     if not row:
         return 0
     return row[0]
@@ -480,6 +495,79 @@ async def on_startup(application: Application) -> None:
         logger.exception("Startup auto top-up failed: %s", err)
 
 
+async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat:
+        return
+    if chat.type != "private":
+        return
+    if not user:
+        return
+
+    owner_id_raw = os.getenv("STATS_OWNER_USER_ID", "").strip()
+    if owner_id_raw:
+        try:
+            owner_id = int(owner_id_raw)
+        except ValueError:
+            await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+            return
+        if user.id != owner_id:
+            return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    day_key, month_key = current_keys()
+    allowed = sorted(allowed_chat_ids())
+    business_connection_id = resolve_business_connection_id() or "невідомо"
+    auto_enabled = parse_bool_env("AUTO_TOPUP_ENABLED", True)
+    threshold = os.getenv("AUTO_TOPUP_THRESHOLD", str(DEFAULT_AUTO_TOPUP_THRESHOLD))
+    amount = os.getenv("AUTO_TOPUP_AMOUNT", str(DEFAULT_AUTO_TOPUP_AMOUNT))
+
+    try:
+        balance = await get_my_star_balance(token)
+        balance_text = str(balance)
+    except Exception as err:
+        balance_text = f"помилка: {err}"
+
+    lines = [
+        "Статус бота",
+        f"- Баланс бота: {balance_text} Stars",
+        f"- AUTO_TOPUP_ENABLED: {1 if auto_enabled else 0}",
+        f"- AUTO_TOPUP_THRESHOLD: {threshold}",
+        f"- AUTO_TOPUP_AMOUNT: {amount}",
+        f"- business_connection_id: {business_connection_id}",
+        f"- Місяць: {month_key}",
+        f"- День: {day_key}",
+    ]
+
+    if not allowed:
+        lines.append("- ALLOWED_CHAT_IDS: порожній (бот ніде не працює)")
+    else:
+        lines.append("- Групи у whitelist:")
+        for chat_id in allowed:
+            month_state = get_month_state(chat_id, month_key)
+            left_50 = max(0, MONTHLY_QUOTAS[50] - month_state.sent_50)
+            left_25 = max(0, MONTHLY_QUOTAS[25] - month_state.sent_25)
+            left_15 = max(0, MONTHLY_QUOTAS[15] - month_state.sent_15)
+            attempts_today = get_daily_attempt(chat_id, day_key)
+            claim = get_daily_claim(chat_id, day_key)
+            if claim:
+                winner_text = f"{claim.winner_name or f'ID {claim.user_id}'} (спроба #{claim.attempt_no})"
+            else:
+                winner_text = "ще не було"
+            lines.append(
+                f"  {chat_id}: залишок 50/25/15 = {left_50}/{left_25}/{left_15}, "
+                f"спроб сьогодні = {attempts_today}, переможець = {winner_text}"
+            )
+
+    await message.reply_text("\n".join(lines))
+
+
 def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
     bag = state.remaining_units()
     if not bag:
@@ -598,6 +686,7 @@ def build_app() -> Application:
     init_db()
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(TypeHandler(Update, on_any_update, block=False), group=-1)
+    app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & filters.Dice.SLOT_MACHINE,
