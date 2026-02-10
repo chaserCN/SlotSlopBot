@@ -13,8 +13,16 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram import LabeledPrice, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    TypeHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -660,6 +668,63 @@ async def on_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(f"Не вдалося поповнити Stars: {err}")
 
 
+async def on_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    if context.args:
+        amount_raw = context.args[0]
+    else:
+        amount_raw = os.getenv("AUTO_TOPUP_AMOUNT", str(DEFAULT_AUTO_TOPUP_AMOUNT))
+
+    try:
+        amount = int(amount_raw)
+    except ValueError:
+        await message.reply_text("Сума має бути числом. Приклад: /buy 615")
+        return
+
+    if amount < 1 or amount > 10000:
+        await message.reply_text("Сума має бути в діапазоні 1..10000.")
+        return
+
+    await context.bot.send_invoice(
+        chat_id=chat.id,
+        title="Поповнення балансу бота",
+        description=f"Оплата {amount} Stars для балансу бота",
+        payload=f"bot_topup_{amount}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Stars", amount=amount)],
+        provider_token="",
+    )
+
+
+async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if not query:
+        return
+    await query.answer(ok=True)
+
+
+async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.successful_payment:
+        return
+    amount = message.successful_payment.total_amount
+    currency = message.successful_payment.currency
+    await message.reply_text(f"Платіж успішний: {amount} {currency}. Stars зарахуються на баланс бота.")
+
+
 def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
     bag = state.remaining_units()
     if not bag:
@@ -780,6 +845,9 @@ def build_app() -> Application:
     app.add_handler(TypeHandler(Update, on_any_update, block=False), group=-1)
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
+    app.add_handler(PreCheckoutQueryHandler(on_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & filters.Dice.SLOT_MACHINE,
