@@ -951,10 +951,6 @@ async def send_visual_gift_message(
 ) -> None:
     try:
         await message.reply_document(document=sticker_file_id)
-        await message.reply_text(
-            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-            "Надіслано як документ."
-        )
         return
     except BadRequest as err:
         # Some Telegram file_ids are not accepted directly by sendDocument (Document_invalid).
@@ -967,28 +963,90 @@ async def send_visual_gift_message(
                 file_bytes.seek(0)
                 filename = tg_file.file_path.split("/")[-1] if tg_file.file_path else f"gift_{gift_id}.tgs"
                 await message.reply_document(document=InputFile(file_bytes, filename=filename))
-                await message.reply_text(
-                    f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-                    "Надіслано як документ (через re-upload)."
-                )
                 return
-            except Exception as nested_err:
-                await message.reply_text(
-                    f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-                    f"Не вдалося навіть після завантаження файла: {nested_err}. Показую текстом."
-                )
+            except Exception:
                 return
-        await message.reply_text(
-            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-            f"Telegram не дозволив надіслати файл ({err}). Показую текстом."
-        )
         return
+    except Exception:
+        return
+
+
+async def deliver_gift_like_win(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    token: str,
+    chat_id: int,
+    user_id: int,
+    winner_name: str,
+    attempt_no: int,
+    day_key: str,
+    month_key: str,
+    stars_tier: int,
+    persist_claim: bool,
+    notify_owner: bool,
+) -> bool:
+    try:
+        gifts = await get_available_gifts(token)
     except Exception as err:
+        await message.reply_text(f"Помилка Telegram API (getAvailableGifts): {err}")
+        return False
+
+    gift, actual_stars = pick_gift_by_stars(gifts, stars_tier)
+    if not gift or actual_stars is None:
         await message.reply_text(
-            f"Виграшний подарунок: {actual_stars} Stars (gift_id={gift_id}). "
-            f"Помилка відправки файла: {err}. Показую текстом."
+            f"Немає доступного подарунка для категорії {stars_tier} Stars "
+            f"(або нижчих 25/15, якщо дозволено fallback)."
         )
-        return
+        return False
+
+    sticker_file_id = get_gift_sticker_file_id(gift)
+    if not sticker_file_id:
+        gift_id = gift.get("id")
+        await message.reply_text(
+            f"Подарунок знайдено, але без sticker.file_id (gift_id={gift_id}). "
+            "Тому показую текстом: виграшний тип подарунка визначено."
+        )
+        return False
+
+    await send_visual_gift_message(
+        message,
+        context,
+        sticker_file_id=sticker_file_id,
+        actual_stars=actual_stars,
+        gift_id=gift.get("id"),
+    )
+
+    if persist_claim:
+        save_successful_claim(
+            chat_id=chat_id,
+            user_id=user_id,
+            winner_name=winner_name,
+            attempt_no=attempt_no,
+            day_key=day_key,
+            month_key=month_key,
+            stars=actual_stars,
+        )
+
+    if notify_owner:
+        try:
+            await notify_winner_to_owner(
+                context,
+                chat_id=chat_id,
+                winner_name=winner_name,
+                winner_user_id=user_id,
+                attempt_no=attempt_no,
+                stars_tier=actual_stars,
+                gift=gift,
+            )
+        except Exception as err:
+            logger.exception("Failed to notify owner about winner: %s", err)
+
+    await message.reply_text(
+        f"Візуальний подарунок показано в чаті: {actual_stars} Stars.\n"
+        f"Сьогодні вибив(ла) {winner_name} зі спроби #{attempt_no}."
+    )
+    return True
 
 
 async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1010,36 +1068,21 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("BOT_TOKEN не налаштовано.")
         return
 
-    target_stars = 15
-    if context.args:
-        try:
-            target_stars = int(context.args[0])
-        except ValueError:
-            await message.reply_text("Сума має бути числом. Приклад: /teststicker 25")
-            return
-
-    try:
-        gifts = await get_available_gifts(token)
-    except Exception as err:
-        await message.reply_text(f"Не вдалося отримати подарунки: {err}")
-        return
-
-    gift, actual_stars = pick_gift_by_stars(gifts, target_stars)
-    if not gift or actual_stars is None:
-        await message.reply_text("Не знайдено подарунка для тесту.")
-        return
-
-    sticker_file_id = get_gift_sticker_file_id(gift)
-    if not sticker_file_id:
-        await message.reply_text(f"У gift_id={gift.get('id')} немає sticker.file_id")
-        return
-
-    await send_visual_gift_message(
+    target_stars = random.choice([15, 25, 50])
+    day_key, month_key = current_keys()
+    await deliver_gift_like_win(
         message,
         context,
-        sticker_file_id=sticker_file_id,
-        actual_stars=actual_stars,
-        gift_id=gift.get("id"),
+        token=token,
+        chat_id=chat.id,
+        user_id=user.id,
+        winner_name=(user.full_name or "Переможець"),
+        attempt_no=1,
+        day_key=day_key,
+        month_key=month_key,
+        stars_tier=target_stars,
+        persist_claim=False,
+        notify_owner=False,
     )
 
 
@@ -1122,60 +1165,19 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         try:
-            try:
-                gifts = await get_available_gifts(token)
-            except Exception as err:
-                await message.reply_text(f"Помилка Telegram API (getAvailableGifts): {err}")
-                return
-
-            gift, actual_stars = pick_gift_by_stars(gifts, stars_tier)
-            if not gift or actual_stars is None:
-                await message.reply_text(
-                    f"Немає доступного подарунка для категорії {stars_tier} Stars "
-                    f"(або нижчих 25/15, якщо дозволено fallback)."
-                )
-                return
-
-            sticker_file_id = get_gift_sticker_file_id(gift)
-            if not sticker_file_id:
-                gift_id = gift.get("id")
-                await message.reply_text(
-                    f"Подарунок знайдено, але без sticker.file_id (gift_id={gift_id}). "
-                    "Тому показую текстом: виграшний тип подарунка визначено."
-                )
-                return
-
-            await send_visual_gift_message(
+            await deliver_gift_like_win(
                 message,
                 context,
-                sticker_file_id=sticker_file_id,
-                actual_stars=actual_stars,
-                gift_id=gift.get("id"),
-            )
-            save_successful_claim(
+                token=token,
                 chat_id=chat_id,
                 user_id=user_id,
                 winner_name=winner_name,
                 attempt_no=current_attempt_no,
                 day_key=day_key,
                 month_key=month_key,
-                stars=actual_stars,
-            )
-            try:
-                await notify_winner_to_owner(
-                    context,
-                    chat_id=chat_id,
-                    winner_name=winner_name,
-                    winner_user_id=user_id,
-                    attempt_no=current_attempt_no,
-                    stars_tier=actual_stars,
-                    gift=gift,
-                )
-            except Exception as err:
-                logger.exception("Failed to notify owner about winner: %s", err)
-            await message.reply_text(
-                f"Візуальний подарунок показано в чаті: {actual_stars} Stars.\n"
-                f"Сьогодні вибив(ла) {winner_name} зі спроби #{current_attempt_no}."
+                stars_tier=stars_tier,
+                persist_claim=True,
+                notify_owner=True,
             )
         except Exception as err:
             logger.exception("Failed to send gift: %s", err)
