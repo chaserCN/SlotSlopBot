@@ -1124,6 +1124,7 @@ async def notify_winner_to_owner(
     *,
     chat_id: int,
     winner_name: str,
+    winner_username: str | None,
     winner_user_id: int,
     attempt_no: int,
     stars_tier: int,
@@ -1139,11 +1140,13 @@ async def notify_winner_to_owner(
     gift_id = gift.get("id")
     sellable = 1 if is_sellable_gift(gift) else 0
     user_link = f"tg://user?id={winner_user_id}"
+    username_text = f"@{winner_username}" if winner_username else "-"
     day_key, month_key = current_keys()
     text = (
         "Переможець дня\n"
         f"- Група: {chat_id}\n"
         f"- Користувач: {winner_name}\n"
+        f"- Username: {username_text}\n"
         f"- Link: {user_link}\n"
         f"- Спроба: #{attempt_no}\n"
         f"- Тип подарунка: {stars_tier} Stars\n"
@@ -1192,6 +1195,7 @@ async def deliver_gift_like_win(
     chat_id: int,
     user_id: int,
     winner_name: str,
+    winner_username: str | None,
     attempt_no: int,
     day_key: str,
     month_key: str,
@@ -1247,6 +1251,7 @@ async def deliver_gift_like_win(
                 context,
                 chat_id=chat_id,
                 winner_name=winner_name,
+                winner_username=winner_username,
                 winner_user_id=user_id,
                 attempt_no=attempt_no,
                 stars_tier=actual_stars,
@@ -1290,6 +1295,7 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id=chat.id,
         user_id=user.id,
         winner_name=(user.full_name or "Переможець"),
+        winner_username=user.username,
         attempt_no=1,
         day_key=day_key,
         month_key=month_key,
@@ -1344,6 +1350,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     winner_name = user.full_name or "Переможець"
+    winner_username = user.username
     daily_limit_text = os.getenv("DAILY_LIMIT_TEXT", DEFAULT_DAILY_LIMIT_TEXT)
     monthly_limit_text = os.getenv("MONTHLY_LIMIT_TEXT", DEFAULT_MONTHLY_LIMIT_TEXT)
     cooldown_min_raw = os.getenv("DAILY_NOTICE_COOLDOWN_MIN", str(DEFAULT_DAILY_NOTICE_COOLDOWN_MIN))
@@ -1385,6 +1392,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 user_id=user_id,
                 winner_name=winner_name,
+                winner_username=winner_username,
                 attempt_no=current_attempt_no,
                 day_key=day_key,
                 month_key=month_key,
