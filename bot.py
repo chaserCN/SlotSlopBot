@@ -48,6 +48,8 @@ DEFAULT_MONTHLY_LIMIT_TEXT = "Місячний ліміт подарунків �
 DEFAULT_DAILY_NOTICE_COOLDOWN_MIN = 10
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
+# Slot dice values for three identical symbols (BAR/Berries/Lemon/7).
+WINNING_SLOT_VALUES = {1, 22, 43, 64}
 DB_PATH = Path(os.getenv("DB_PATH", "gift_state.sqlite3"))
 API_BASE = "https://api.telegram.org"
 CLAIM_LOCK = asyncio.Lock()
@@ -1182,7 +1184,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await message.reply_text(daily_limit_text)
             return
 
-        if message.dice.value != 64:
+        if message.dice.value not in WINNING_SLOT_VALUES:
             return
 
         month_state = get_month_state(chat_id, month_key)
