@@ -5,6 +5,7 @@ import random
 import sqlite3
 import asyncio
 import calendar
+import ssl
 from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
+import certifi
 from telegram import InputFile, LabeledPrice, Update
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -1349,7 +1351,15 @@ async def send_visual_nft_by_slug(
     url = f"https://nft.fragment.com/gift/{quote(slug_value)}.tgs"
 
     def _download() -> bytes:
-        with urlopen(url, timeout=20) as response:
+        req = Request(
+            url=url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "*/*",
+            },
+        )
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        with urlopen(req, timeout=20, context=ssl_ctx) as response:
             return response.read()
 
     try:
@@ -1417,10 +1427,8 @@ async def deliver_gift_like_win(
                 gift_stars = gift.get("star_count")
                 if isinstance(gift_stars, int):
                     actual_stars = gift_stars
-            elif success_caption:
-                await message.reply_text(
-                    f"⚠️ Візуал недоступний: не вдалося завантажити .tgs для gift_id={normalized_gift_id}."
-                )
+            else:
+                logger.warning("Visual unavailable for NFT gift_id=%s: tgs download failed and gift not found in catalog", normalized_gift_id)
     else:
         try:
             gifts = await get_available_gifts(token)
@@ -1460,16 +1468,13 @@ async def deliver_gift_like_win(
                         slug=slug,
                         gift_id=str(gift_id),
                     )
-            if not visual_sent:
+            if not visual_sent and is_announced_flow:
+                logger.warning("Visual unavailable for NFT gift_id=%s: no sticker.file_id and tgs download failed", gift_id)
+            elif not visual_sent:
                 await message.reply_text(
                     f"Подарунок знайдено, але без sticker.file_id (gift_id={gift_id}). "
                     "Тому показую текстом: виграшний тип подарунка визначено."
                 )
-            if success_caption and not visual_sent:
-                await message.reply_text(
-                    f"⚠️ Візуал недоступний: у gift_id={gift_id} немає sticker.file_id і .tgs не завантажено."
-                )
-            if not is_announced_flow:
                 return False
 
     claim_saved = True
@@ -1509,11 +1514,19 @@ async def deliver_gift_like_win(
     if success_caption:
         await message.reply_text(success_caption)
     else:
-        await message.reply_text(
-            f"✅ Є переможець дня: {winner_name}. "
-            f"Спроба: {attempt_no}.\n"
-            f"Випав приз за {actual_stars} Stars 🎉"
-        )
+        if is_announced_flow:
+            nft_title = resolve_nft_title(normalized_gift_id) if normalized_gift_id else None
+            await message.reply_text(
+                f"✅ Є переможець дня: {winner_name}. "
+                f"Спроба: {attempt_no}.\n"
+                + (f"Випав приз: {nft_title} 🎉" if nft_title else "Випав приз 🎉")
+            )
+        else:
+            await message.reply_text(
+                f"✅ Є переможець дня: {winner_name}. "
+                f"Спроба: {attempt_no}.\n"
+                f"Випав приз за {actual_stars} Stars 🎉"
+            )
     return True
 
 
@@ -1543,7 +1556,6 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text("NFT-пул порожній (MONTHLY_NFT_POOL).")
             return
         selected_id = random.choice(nft_pool)
-        selected_title = resolve_nft_title(selected_id)
         day_key, month_key = current_keys()
         await deliver_gift_like_win(
             message,
@@ -1560,11 +1572,6 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             persist_claim=False,
             notify_owner=False,
             announced_gift_id=selected_id,
-            success_caption=(
-                f"Тест NFT-призу: {selected_title} (gift_id={selected_id})"
-                if selected_title
-                else f"Тест NFT-призу: gift_id={selected_id}"
-            ),
         )
         return
 
@@ -1671,7 +1678,6 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         selected_nft_gift_id, nft_left, draws_left, nft_probability = pick_monthly_nft_gift(month_key)
         if selected_nft_gift_id:
-            selected_nft_title = resolve_nft_title(selected_nft_gift_id)
             logger.info(
                 "NFT prize selected: chat_id=%s user_id=%s month=%s gift_id=%s nft_left=%s draws_left=%s p=%.4f",
                 chat_id,
@@ -1698,13 +1704,6 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     persist_claim=True,
                     notify_owner=True,
                     announced_gift_id=selected_nft_gift_id,
-                    success_caption=(
-                        f"✅ Є переможець дня: {winner_name}. "
-                        f"Спроба: {current_attempt_no}.\n"
-                        f"Випав NFT-приз: {selected_nft_title} (gift_id={selected_nft_gift_id}) 🎉"
-                        if selected_nft_title
-                        else f"Випав NFT-приз (gift_id={selected_nft_gift_id}) 🎉"
-                    ),
                 )
                 if delivered:
                     saved = save_monthly_nft_claim(
