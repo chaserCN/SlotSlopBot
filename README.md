@@ -117,6 +117,21 @@
 - Показує список доступних подарунків: `id`, `stars`, `convert`, `sellable`, `sold_out`.
 - Допомагає перевірити, які подарунки бот вважає "продаваемыми".
 
+## Команда /nfts
+
+- Команда `/nfts` працює лише в особистому чаті з ботом.
+- Якщо задано `STATS_OWNER_USER_ID`, команду може виконати лише цей користувач.
+- Показує список `unique gifts` бізнес-акаунта: `owned_gift_id`, `gift_id`, `model/symbol`, можливість трансферу та fee.
+
+## Команда /transfernft
+
+- Команда `/transfernft` працює лише в особистому чаті з ботом.
+- Якщо задано `STATS_OWNER_USER_ID`, команду може виконати лише цей користувач.
+- Формат:
+  - `/transfernft <owned_gift_id> <user_id>`
+  - `/transfernft <owned_gift_id> <user_id> <star_count>`
+- Команда викликає `transferGift` і передає `unique gift` користувачу.
+
 ## Команда /teststicker
 
 - Команда `/teststicker` працює лише в особистому чаті з ботом для `STATS_OWNER_USER_ID`.

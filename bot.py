@@ -529,6 +529,42 @@ async def get_my_star_balance(token: str) -> int:
     return 0
 
 
+async def get_business_account_gifts(
+    token: str,
+    business_connection_id: str,
+    *,
+    offset: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"business_connection_id": business_connection_id}
+    if isinstance(offset, str) and offset:
+        payload["offset"] = offset
+    if isinstance(limit, int) and limit > 0:
+        payload["limit"] = max(1, min(100, limit))
+    result = await asyncio.to_thread(_api_call, token, "getBusinessAccountGifts", payload)
+    if isinstance(result, dict):
+        return result
+    return {}
+
+
+async def transfer_gift_to_user(
+    token: str,
+    business_connection_id: str,
+    owned_gift_id: str,
+    new_owner_chat_id: int,
+    *,
+    star_count: int | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "business_connection_id": business_connection_id,
+        "owned_gift_id": owned_gift_id,
+        "new_owner_chat_id": new_owner_chat_id,
+    }
+    if isinstance(star_count, int) and star_count > 0:
+        payload["star_count"] = star_count
+    await asyncio.to_thread(_api_call, token, "transferGift", payload)
+
+
 async def transfer_business_account_stars(token: str, business_connection_id: str, star_count: int) -> None:
     payload = {
         "business_connection_id": business_connection_id,
@@ -861,6 +897,154 @@ async def on_gifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(text) > 3500:
         text = text[:3500] + "\n...обрізано"
     await message.reply_text(text)
+
+
+def is_unique_owned_gift(gift: dict[str, Any]) -> bool:
+    gift_type = str(gift.get("type", "")).lower()
+    if gift_type == "unique":
+        return True
+    inner = gift.get("gift")
+    if isinstance(inner, dict):
+        # Fallback heuristic for older/newer payload shapes.
+        if any(key in inner for key in ("model", "symbol", "backdrop", "gift_id", "is_from_blockchain")):
+            return True
+    return False
+
+
+async def on_nfts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    business_connection_id = resolve_business_connection_id()
+    if not business_connection_id:
+        await message.reply_text("Не знайдено business_connection_id. Підключи бізнес-бота або задай BUSINESS_CONNECTION_ID.")
+        return
+
+    all_gifts: list[dict[str, Any]] = []
+    offset: str | None = None
+    try:
+        for _ in range(5):
+            result = await get_business_account_gifts(token, business_connection_id, offset=offset, limit=100)
+            batch = result.get("gifts", [])
+            if isinstance(batch, list):
+                all_gifts.extend([item for item in batch if isinstance(item, dict)])
+            next_offset = result.get("next_offset")
+            if not isinstance(next_offset, str) or not next_offset or next_offset == offset:
+                break
+            offset = next_offset
+    except Exception as err:
+        await message.reply_text(f"Не вдалося отримати gifts бізнес-акаунта: {err}")
+        return
+
+    unique_gifts = [gift for gift in all_gifts if is_unique_owned_gift(gift)]
+    if not unique_gifts:
+        await message.reply_text("NFT (unique gifts) не знайдено.")
+        return
+
+    lines = [f"NFT (unique gifts): {len(unique_gifts)}"]
+    for gift in unique_gifts:
+        owned_gift_id = gift.get("owned_gift_id")
+        can_transfer = 1 if bool(gift.get("can_be_transferred")) else 0
+        transfer_star_count = gift.get("transfer_star_count")
+        next_transfer_date = gift.get("next_transfer_date")
+        inner = gift.get("gift")
+        gift_id: Any = None
+        model: Any = None
+        symbol: Any = None
+        if isinstance(inner, dict):
+            gift_id = inner.get("gift_id", inner.get("id"))
+            model = inner.get("model")
+            symbol = inner.get("symbol")
+        lines.append(
+            f"- owned_gift_id={owned_gift_id} gift_id={gift_id} model={model} symbol={symbol} "
+            f"can_transfer={can_transfer} fee={transfer_star_count} next_transfer_date={next_transfer_date}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        text = text[:3500] + "\n...обрізано"
+    await message.reply_text(text)
+
+
+async def on_transfernft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        await message.reply_text("BOT_TOKEN не налаштовано.")
+        return
+
+    business_connection_id = resolve_business_connection_id()
+    if not business_connection_id:
+        await message.reply_text("Не знайдено business_connection_id. Підключи бізнес-бота або задай BUSINESS_CONNECTION_ID.")
+        return
+
+    if len(context.args) < 2:
+        await message.reply_text("Формат: /transfernft <owned_gift_id> <user_id> [star_count]")
+        return
+
+    owned_gift_id = context.args[0].strip()
+    if not owned_gift_id:
+        await message.reply_text("owned_gift_id порожній.")
+        return
+
+    try:
+        new_owner_chat_id = int(context.args[1])
+    except ValueError:
+        await message.reply_text("user_id має бути числом. Формат: /transfernft <owned_gift_id> <user_id> [star_count]")
+        return
+
+    star_count: int | None = None
+    if len(context.args) >= 3:
+        try:
+            star_count = int(context.args[2])
+        except ValueError:
+            await message.reply_text("star_count має бути числом.")
+            return
+        if star_count < 0 or star_count > 100000:
+            await message.reply_text("star_count має бути в діапазоні 0..100000.")
+            return
+
+    try:
+        await transfer_gift_to_user(
+            token,
+            business_connection_id,
+            owned_gift_id,
+            new_owner_chat_id,
+            star_count=star_count,
+        )
+        fee_text = f", fee={star_count}" if isinstance(star_count, int) and star_count > 0 else ""
+        await message.reply_text(
+            f"NFT передано успішно.\nowned_gift_id={owned_gift_id}\nnew_owner_chat_id={new_owner_chat_id}{fee_text}"
+        )
+    except Exception as err:
+        await message.reply_text(f"Не вдалося передати NFT: {err}")
 
 
 async def on_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1226,6 +1410,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("gifts", on_gifts, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("nfts", on_nfts, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("transfernft", on_transfernft, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("teststicker", on_teststicker, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("resetday", on_resetday, filters=filters.ChatType.PRIVATE))
     app.add_handler(PreCheckoutQueryHandler(on_precheckout))
