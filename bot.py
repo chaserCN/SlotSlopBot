@@ -83,6 +83,13 @@ class DailyClaim:
     claimed_stars: int
 
 
+@dataclass(frozen=True)
+class NftPoolItem:
+    gift_id: str
+    slug: str | None
+    title: str | None
+
+
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -377,37 +384,45 @@ def parse_bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def parse_monthly_nft_pool() -> list[tuple[str, str | None]]:
+def parse_monthly_nft_pool() -> list[NftPoolItem]:
     raw_pool = os.getenv("MONTHLY_NFT_POOL", "")
-    result: list[tuple[str, str | None]] = []
+    result: list[NftPoolItem] = []
     seen: set[str] = set()
 
     for chunk in raw_pool.split(","):
         item = chunk.strip()
         if not item:
             continue
-        if ":" in item:
-            gift_id, slug = item.split(":", 1)
-            gift_id = gift_id.strip()
-            slug = slug.strip() or None
-        else:
-            gift_id = item
-            slug = None
+        parts = item.split(":", 2)
+        gift_id = parts[0].strip() if parts else ""
+        slug: str | None = None
+        title: str | None = None
+        if len(parts) >= 2:
+            slug = parts[1].strip() or None
+        if len(parts) >= 3:
+            title = parts[2].strip() or None
         if not gift_id.isdigit():
             logger.warning("Invalid gift id in MONTHLY_NFT_POOL: %s", item)
             continue
         if gift_id in seen:
             continue
         seen.add(gift_id)
-        result.append((gift_id, slug))
+        result.append(NftPoolItem(gift_id=gift_id, slug=slug, title=title))
 
     return result
 
 
 def resolve_nft_slug(gift_id: str) -> str | None:
-    for pool_gift_id, slug in parse_monthly_nft_pool():
-        if pool_gift_id == gift_id:
-            return slug
+    for item in parse_monthly_nft_pool():
+        if item.gift_id == gift_id:
+            return item.slug
+    return None
+
+
+def resolve_nft_title(gift_id: str) -> str | None:
+    for item in parse_monthly_nft_pool():
+        if item.gift_id == gift_id:
+            return item.title
     return None
 
 
@@ -460,7 +475,7 @@ def month_draws_left(now: datetime) -> int:
 
 
 def pick_monthly_nft_gift(month_key: str) -> tuple[str | None, int, int, float]:
-    pool = [gift_id for gift_id, _ in parse_monthly_nft_pool()]
+    pool = [item.gift_id for item in parse_monthly_nft_pool()]
     if not pool:
         return None, 0, 0, 0.0
     used = get_claimed_monthly_nft_gift_ids(month_key)
@@ -837,7 +852,7 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"- Місяць: {month_key}",
         f"- День: {day_key}",
     ]
-    nft_pool = [gift_id for gift_id, _ in parse_monthly_nft_pool()]
+    nft_pool = [item.gift_id for item in parse_monthly_nft_pool()]
     claimed_nft_ids = get_claimed_monthly_nft_gift_ids(month_key)
     remaining_nft = [gift_id for gift_id in nft_pool if gift_id not in claimed_nft_ids]
     lines.append(
@@ -1373,12 +1388,7 @@ async def deliver_gift_like_win(
     announced_gift_id: str | None = None,
     success_caption: str | None = None,
 ) -> bool:
-    try:
-        gifts = await get_available_gifts(token)
-    except Exception as err:
-        await message.reply_text(f"Помилка Telegram API (getAvailableGifts): {err}")
-        return False
-
+    gifts: list[dict[str, Any]] = []
     gift: dict[str, Any] | None = None
     actual_stars = stars_tier
     is_announced_flow = bool((announced_gift_id or "").strip())
@@ -1386,25 +1396,37 @@ async def deliver_gift_like_win(
     visual_sent = False
 
     if normalized_gift_id:
-        gift = pick_gift_by_id(gifts, normalized_gift_id)
-        if gift:
-            gift_stars = gift.get("star_count")
-            if isinstance(gift_stars, int):
-                actual_stars = gift_stars
-        else:
-            logger.info("Announced gift_id=%s was not found in getAvailableGifts catalog", normalized_gift_id)
-            slug = resolve_nft_slug(normalized_gift_id)
-            if slug:
-                visual_sent = await send_visual_nft_by_slug(
-                    message,
-                    slug=slug,
-                    gift_id=normalized_gift_id,
-                )
-            if not visual_sent and success_caption:
+        # For NFT flow prefer slug->fragment .tgs, because bot catalog is unrelated to payer inventory.
+        slug = resolve_nft_slug(normalized_gift_id)
+        if slug:
+            visual_sent = await send_visual_nft_by_slug(
+                message,
+                slug=slug,
+                gift_id=normalized_gift_id,
+            )
+
+        if not visual_sent:
+            try:
+                gifts = await get_available_gifts(token)
+                gift = pick_gift_by_id(gifts, normalized_gift_id)
+            except Exception as err:
+                logger.info("Fallback getAvailableGifts failed for gift_id=%s: %s", normalized_gift_id, err)
+                gift = None
+
+            if gift:
+                gift_stars = gift.get("star_count")
+                if isinstance(gift_stars, int):
+                    actual_stars = gift_stars
+            elif success_caption:
                 await message.reply_text(
-                    f"⚠️ Візуал недоступний: gift_id={normalized_gift_id} не знайдено у getAvailableGifts та не вдалося завантажити .tgs."
+                    f"⚠️ Візуал недоступний: не вдалося завантажити .tgs для gift_id={normalized_gift_id}."
                 )
     else:
+        try:
+            gifts = await get_available_gifts(token)
+        except Exception as err:
+            await message.reply_text(f"Помилка Telegram API (getAvailableGifts): {err}")
+            return False
         gift, picked_stars = pick_gift_by_stars(gifts, stars_tier)
         if not gift or picked_stars is None:
             await message.reply_text(
@@ -1516,11 +1538,12 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     test_nft_mode = bool(context.args) and context.args[0].strip().lower() == "nft"
     if test_nft_mode:
-        nft_pool = [gift_id for gift_id, _ in parse_monthly_nft_pool()]
+        nft_pool = [item.gift_id for item in parse_monthly_nft_pool()]
         if not nft_pool:
             await message.reply_text("NFT-пул порожній (MONTHLY_NFT_POOL).")
             return
         selected_id = random.choice(nft_pool)
+        selected_title = resolve_nft_title(selected_id)
         day_key, month_key = current_keys()
         await deliver_gift_like_win(
             message,
@@ -1537,7 +1560,11 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             persist_claim=False,
             notify_owner=False,
             announced_gift_id=selected_id,
-            success_caption=f"Тест NFT-призу: gift_id={selected_id}",
+            success_caption=(
+                f"Тест NFT-призу: {selected_title} (gift_id={selected_id})"
+                if selected_title
+                else f"Тест NFT-призу: gift_id={selected_id}"
+            ),
         )
         return
 
@@ -1644,6 +1671,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         selected_nft_gift_id, nft_left, draws_left, nft_probability = pick_monthly_nft_gift(month_key)
         if selected_nft_gift_id:
+            selected_nft_title = resolve_nft_title(selected_nft_gift_id)
             logger.info(
                 "NFT prize selected: chat_id=%s user_id=%s month=%s gift_id=%s nft_left=%s draws_left=%s p=%.4f",
                 chat_id,
@@ -1673,7 +1701,9 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     success_caption=(
                         f"✅ Є переможець дня: {winner_name}. "
                         f"Спроба: {current_attempt_no}.\n"
-                        f"Випав NFT-приз (gift_id={selected_nft_gift_id}) 🎉"
+                        f"Випав NFT-приз: {selected_nft_title} (gift_id={selected_nft_gift_id}) 🎉"
+                        if selected_nft_title
+                        else f"Випав NFT-приз (gift_id={selected_nft_gift_id}) 🎉"
                     ),
                 )
                 if delivered:
