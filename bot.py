@@ -611,6 +611,11 @@ async def on_startup(application: Application) -> None:
     if not token:
         return
     try:
+        me = await application.bot.get_me()
+        logger.info("Bot identity: id=%s username=@%s", me.id, me.username)
+    except Exception as err:
+        logger.warning("Failed to fetch bot identity: %s", err)
+    try:
         await maybe_auto_topup(token)
     except Exception as err:
         logger.exception("Startup auto top-up failed: %s", err)
@@ -687,6 +692,28 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     await message.reply_text("\n".join(lines))
+
+
+async def on_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+
+    logger.info(
+        "ID probe: chat_id=%s chat_type=%s user_id=%s username=@%s",
+        chat.id,
+        chat.type,
+        user.id,
+        user.username or "",
+    )
+    await message.reply_text(
+        "IDs\n"
+        f"- chat_id: {chat.id}\n"
+        f"- user_id: {user.id}\n"
+        f"- username: @{user.username or '-'}"
+    )
 
 
 async def on_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1192,6 +1219,7 @@ def build_app() -> Application:
     init_db()
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(TypeHandler(Update, on_any_update, block=False), group=-1)
+    app.add_handler(CommandHandler("ids", on_ids))
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
