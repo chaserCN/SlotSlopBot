@@ -1444,36 +1444,25 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not nft_pool:
             await message.reply_text("NFT-пул порожній (MONTHLY_NFT_GIFT_IDS).")
             return
-        try:
-            gifts = await get_available_gifts(token)
-        except Exception as err:
-            await message.reply_text(f"Не вдалося отримати подарунки: {err}")
-            return
-
-        random_pool = nft_pool[:]
-        random.shuffle(random_pool)
-        selected: dict[str, Any] | None = None
-        selected_id: str | None = None
-        for nft_id in random_pool:
-            found = pick_gift_by_id(gifts, nft_id)
-            if found and get_gift_sticker_file_id(found):
-                selected = found
-                selected_id = nft_id
-                break
-        if not selected or not selected_id:
-            await message.reply_text(
-                "Не знайшов NFT зі стикером у getAvailableGifts для MONTHLY_NFT_GIFT_IDS."
-            )
-            return
-
-        await send_visual_gift_message(
+        selected_id = random.choice(nft_pool)
+        day_key, month_key = current_keys()
+        await deliver_gift_like_win(
             message,
             context,
-            sticker_file_id=get_gift_sticker_file_id(selected) or "",
-            actual_stars=int(selected.get("star_count") or 0),
-            gift_id=selected.get("id"),
+            token=token,
+            chat_id=chat.id,
+            user_id=user.id,
+            winner_name=(user.full_name or "Переможець"),
+            winner_username=user.username,
+            attempt_no=1,
+            day_key=day_key,
+            month_key=month_key,
+            stars_tier=0,
+            persist_claim=False,
+            notify_owner=False,
+            announced_gift_id=selected_id,
+            success_caption=f"Тест NFT-призу: gift_id={selected_id}",
         )
-        await message.reply_text(f"Тест NFT-стікера: gift_id={selected_id}")
         return
 
     target_stars = random.choice([15, 25, 50])
