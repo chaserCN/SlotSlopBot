@@ -443,9 +443,9 @@ def save_successful_claim(
     day_key: str,
     month_key: str,
     stars: int,
-) -> None:
+) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
+        inserted = conn.execute(
             """
             INSERT OR IGNORE INTO daily_claims (
                 chat_id, day_key, user_id, winner_name, attempt_no, claimed_stars, created_at
@@ -454,6 +454,10 @@ def save_successful_claim(
             """,
             (chat_id, day_key, user_id, winner_name, attempt_no, stars, datetime.now(timezone.utc).isoformat()),
         )
+        # If claim already exists, don't mutate monthly counters and signal caller.
+        if inserted.rowcount == 0:
+            conn.commit()
+            return False
         conn.execute(
             """
             INSERT INTO monthly_claims (chat_id, month_key, sent_50, sent_25, sent_15)
@@ -490,6 +494,7 @@ def save_successful_claim(
                 (chat_id, month_key),
             )
         conn.commit()
+    return True
 
 
 def _api_call(token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1234,8 +1239,9 @@ async def deliver_gift_like_win(
         gift_id=gift.get("id"),
     )
 
+    claim_saved = True
     if persist_claim:
-        save_successful_claim(
+        claim_saved = save_successful_claim(
             chat_id=chat_id,
             user_id=user_id,
             winner_name=winner_name,
@@ -1244,8 +1250,15 @@ async def deliver_gift_like_win(
             month_key=month_key,
             stars=actual_stars,
         )
+        if not claim_saved:
+            logger.warning(
+                "Claim already exists, skipping owner notify: chat_id=%s day_key=%s user_id=%s",
+                chat_id,
+                day_key,
+                user_id,
+            )
 
-    if notify_owner:
+    if notify_owner and claim_saved:
         try:
             await notify_winner_to_owner(
                 context,
@@ -1353,26 +1366,19 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     winner_username = user.username
     daily_limit_text = os.getenv("DAILY_LIMIT_TEXT", DEFAULT_DAILY_LIMIT_TEXT)
     monthly_limit_text = os.getenv("MONTHLY_LIMIT_TEXT", DEFAULT_MONTHLY_LIMIT_TEXT)
-    cooldown_min_raw = os.getenv("DAILY_NOTICE_COOLDOWN_MIN", str(DEFAULT_DAILY_NOTICE_COOLDOWN_MIN))
-    try:
-        daily_notice_cooldown_min = max(1, int(cooldown_min_raw))
-    except ValueError:
-        daily_notice_cooldown_min = DEFAULT_DAILY_NOTICE_COOLDOWN_MIN
 
     async with CLAIM_LOCK:
         current_attempt_no = increment_daily_attempt(chat_id, day_key)
 
         if has_daily_claim(chat_id, day_key):
-            if should_send_daily_limit_notice(chat_id, day_key, daily_notice_cooldown_min):
-                mark_daily_limit_notice(chat_id, day_key)
-                claim = get_daily_claim(chat_id, day_key)
-                if claim:
-                    winner_label = claim.winner_name or f"ID {claim.user_id}"
-                    await message.reply_text(
-                        f"{daily_limit_text}\nСьогодні виграв(ла): {winner_label} (спроба #{claim.attempt_no})."
-                    )
-                else:
-                    await message.reply_text(daily_limit_text)
+            claim = get_daily_claim(chat_id, day_key)
+            if claim:
+                winner_label = claim.winner_name or f"ID {claim.user_id}"
+                await message.reply_text(
+                    f"{daily_limit_text}\nСьогодні виграв(ла): {winner_label} (спроба #{claim.attempt_no})."
+                )
+            else:
+                await message.reply_text(daily_limit_text)
             return
 
         if message.dice.value not in WINNING_SLOT_VALUES:
