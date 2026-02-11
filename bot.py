@@ -43,9 +43,8 @@ MONTHLY_QUOTAS = {
     15: 22,
 }
 
-DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт уже вичерпано: у цій групі вже видали 1 подарунок."
+DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт вичерпано: денний приз уже видано."
 DEFAULT_MONTHLY_LIMIT_TEXT = "Місячний ліміт подарунків для цієї групи вже вичерпано."
-DEFAULT_DAILY_NOTICE_COOLDOWN_MIN = 10
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
 # Slot dice values for three identical symbols (BAR/Berries/Lemon/7).
@@ -1274,7 +1273,8 @@ async def deliver_gift_like_win(
             logger.exception("Failed to notify owner about winner: %s", err)
 
     await message.reply_text(
-        f"Вітаємо! {winner_name} виграв щоденний приз з #{attempt_no} спроби! "
+        f"✅ Є переможець дня: {winner_name}. "
+        f"Спроба: {attempt_no}.\n"
         f"Випав приз за {actual_stars} Stars 🎉"
     )
     return True
@@ -1364,8 +1364,8 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     winner_name = user.full_name or "Переможець"
     winner_username = user.username
-    daily_limit_text = os.getenv("DAILY_LIMIT_TEXT", DEFAULT_DAILY_LIMIT_TEXT)
-    monthly_limit_text = os.getenv("MONTHLY_LIMIT_TEXT", DEFAULT_MONTHLY_LIMIT_TEXT)
+    daily_limit_text = DEFAULT_DAILY_LIMIT_TEXT
+    monthly_limit_text = DEFAULT_MONTHLY_LIMIT_TEXT
 
     async with CLAIM_LOCK:
         current_attempt_no = increment_daily_attempt(chat_id, day_key)
@@ -1375,7 +1375,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if claim:
                 winner_label = claim.winner_name or f"ID {claim.user_id}"
                 await message.reply_text(
-                    f"{daily_limit_text}\nСьогодні виграв(ла): {winner_label} (спроба #{claim.attempt_no})."
+                    f"{daily_limit_text}\nПереможець дня: {winner_label} (спроба {claim.attempt_no})."
                 )
             else:
                 await message.reply_text(daily_limit_text)
