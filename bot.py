@@ -40,15 +40,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Monthly quotas per group for up to 31 gifts: 3x50, 6x25, 22x15.
-MONTHLY_QUOTAS = {
+# Fixed weights for regular gift tiers.
+REGULAR_PRIZE_WEIGHTS = {
     50: 3,
     25: 6,
     15: 22,
 }
 
-DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт вичерпано: денний приз уже видано."
-DEFAULT_MONTHLY_LIMIT_TEXT = "Місячний ліміт подарунків для цієї групи вже вичерпано."
+DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт вичерпано: призи на сьогодні вже розіграно."
+DEFAULT_DAILY_PRIZE_LIMIT = 1
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
 # Slot dice values for three identical symbols (BAR/Berries/Lemon/7).
@@ -69,12 +69,6 @@ class GroupMonthState:
     sent_50: int
     sent_25: int
     sent_15: int
-
-    def remaining_units(self) -> list[int]:
-        left_50 = max(0, MONTHLY_QUOTAS[50] - self.sent_50)
-        left_25 = max(0, MONTHLY_QUOTAS[25] - self.sent_25)
-        left_15 = max(0, MONTHLY_QUOTAS[15] - self.sent_15)
-        return [50] * left_50 + [25] * left_25 + [15] * left_15
 
 
 @dataclass
@@ -162,6 +156,21 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_claim_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                day_key TEXT NOT NULL,
+                month_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                winner_name TEXT NOT NULL DEFAULT '',
+                attempt_no INTEGER NOT NULL DEFAULT 0,
+                claimed_stars INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -171,15 +180,24 @@ def current_keys() -> tuple[str, str]:
 
 
 def has_daily_claim(chat_id: int, day_key: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM daily_claims WHERE chat_id = ? AND day_key = ?",
-            (chat_id, day_key),
-        ).fetchone()
-    return row is not None
+    return count_daily_claims(chat_id, day_key) > 0
 
 
 def get_daily_claim(chat_id: int, day_key: str) -> DailyClaim | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, winner_name, attempt_no, claimed_stars
+            FROM daily_claim_events
+            WHERE chat_id = ? AND day_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, day_key),
+        ).fetchone()
+    if row:
+        return DailyClaim(user_id=row[0], winner_name=row[1], attempt_no=row[2], claimed_stars=row[3])
+
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
@@ -194,22 +212,45 @@ def get_daily_claim(chat_id: int, day_key: str) -> DailyClaim | None:
     return DailyClaim(user_id=row[0], winner_name=row[1], attempt_no=row[2], claimed_stars=row[3])
 
 
-def reset_daily_claim(chat_id: int, day_key: str, month_key: str) -> tuple[bool, int]:
+def reset_daily_claim(chat_id: int, day_key: str, month_key: str) -> tuple[bool, int, int, int]:
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
+        rows = conn.execute(
             """
             SELECT claimed_stars
-            FROM daily_claims
-            WHERE chat_id = ? AND day_key = ?
+            FROM daily_claim_events
+            WHERE chat_id = ? AND day_key = ? AND month_key = ?
             """,
-            (chat_id, day_key),
-        ).fetchone()
-        if not row:
-            return False, 0
+            (chat_id, day_key, month_key),
+        ).fetchall()
+        stars_rows = [int(r[0]) for r in rows if r and isinstance(r[0], int)]
+        if not stars_rows:
+            row = conn.execute(
+                """
+                SELECT claimed_stars
+                FROM daily_claims
+                WHERE chat_id = ? AND day_key = ?
+                """,
+                (chat_id, day_key),
+            ).fetchone()
+            if row and isinstance(row[0], int):
+                stars_rows = [int(row[0])]
+        if not stars_rows:
+            return False, 0, 0, 0
 
-        claimed_stars = row[0] if isinstance(row[0], int) else 0
+        rollback_50 = sum(1 for stars in stars_rows if stars == 50)
+        rollback_25 = sum(1 for stars in stars_rows if stars == 25)
+        rollback_15 = sum(1 for stars in stars_rows if stars == 15)
+
+        conn.execute(
+            "DELETE FROM daily_claim_events WHERE chat_id = ? AND day_key = ? AND month_key = ?",
+            (chat_id, day_key, month_key),
+        )
         conn.execute(
             "DELETE FROM daily_claims WHERE chat_id = ? AND day_key = ?",
+            (chat_id, day_key),
+        )
+        conn.execute(
+            "DELETE FROM daily_attempts WHERE chat_id = ? AND day_key = ?",
             (chat_id, day_key),
         )
         conn.execute(
@@ -224,36 +265,36 @@ def reset_daily_claim(chat_id: int, day_key: str, month_key: str) -> tuple[bool,
             (chat_id, day_key, month_key),
         )
 
-        if claimed_stars == 50:
+        if rollback_50:
             conn.execute(
                 """
                 UPDATE monthly_claims
-                SET sent_50 = CASE WHEN sent_50 > 0 THEN sent_50 - 1 ELSE 0 END
+                SET sent_50 = CASE WHEN sent_50 >= ? THEN sent_50 - ? ELSE 0 END
                 WHERE chat_id = ? AND month_key = ?
                 """,
-                (chat_id, month_key),
+                (rollback_50, rollback_50, chat_id, month_key),
             )
-        elif claimed_stars == 25:
+        if rollback_25:
             conn.execute(
                 """
                 UPDATE monthly_claims
-                SET sent_25 = CASE WHEN sent_25 > 0 THEN sent_25 - 1 ELSE 0 END
+                SET sent_25 = CASE WHEN sent_25 >= ? THEN sent_25 - ? ELSE 0 END
                 WHERE chat_id = ? AND month_key = ?
                 """,
-                (chat_id, month_key),
+                (rollback_25, rollback_25, chat_id, month_key),
             )
-        elif claimed_stars == 15:
+        if rollback_15:
             conn.execute(
                 """
                 UPDATE monthly_claims
-                SET sent_15 = CASE WHEN sent_15 > 0 THEN sent_15 - 1 ELSE 0 END
+                SET sent_15 = CASE WHEN sent_15 >= ? THEN sent_15 - ? ELSE 0 END
                 WHERE chat_id = ? AND month_key = ?
                 """,
-                (chat_id, month_key),
+                (rollback_15, rollback_15, chat_id, month_key),
             )
 
         conn.commit()
-    return True, claimed_stars
+    return True, rollback_50, rollback_25, rollback_15
 
 
 def increment_daily_attempt(chat_id: int, day_key: str) -> int:
@@ -303,6 +344,43 @@ def get_daily_attempt(chat_id: int, day_key: str) -> int:
     return row[0]
 
 
+def reset_daily_attempt(chat_id: int, day_key: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM daily_attempts
+            WHERE chat_id = ? AND day_key = ?
+            """,
+            (chat_id, day_key),
+        )
+        conn.commit()
+
+
+def count_daily_claims(chat_id: int, day_key: str) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        events_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM daily_claim_events
+            WHERE chat_id = ? AND day_key = ?
+            """,
+            (chat_id, day_key),
+        ).fetchone()
+        legacy_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM daily_claims
+            WHERE chat_id = ? AND day_key = ?
+            """,
+            (chat_id, day_key),
+        ).fetchone()
+    events_count = int(events_row[0]) if events_row and events_row[0] is not None else 0
+    legacy_count = int(legacy_row[0]) if legacy_row and legacy_row[0] is not None else 0
+    if events_count > 0:
+        return events_count
+    return legacy_count
+
+
 def get_month_state(chat_id: int, month_key: str) -> GroupMonthState:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -345,6 +423,42 @@ def set_setting(key: str, value: str) -> None:
 def set_topup_status(status: str, details: str = "") -> None:
     set_setting("topup_status", status)
     set_setting("topup_details", details[:1000])
+
+
+def get_daily_prize_limit() -> int:
+    raw_setting = get_setting("daily_prize_limit")
+    if raw_setting is not None:
+        try:
+            return max(0, min(100, int(raw_setting)))
+        except ValueError:
+            logger.warning("Invalid daily_prize_limit setting=%s. Fallback to env/default.", raw_setting)
+
+    raw_env = os.getenv("DAILY_PRIZE_LIMIT", str(DEFAULT_DAILY_PRIZE_LIMIT)).strip()
+    try:
+        return max(0, min(100, int(raw_env)))
+    except ValueError:
+        logger.warning("Invalid DAILY_PRIZE_LIMIT=%s. Fallback to default=%s", raw_env, DEFAULT_DAILY_PRIZE_LIMIT)
+        return DEFAULT_DAILY_PRIZE_LIMIT
+
+
+def set_daily_prize_limit(limit: int) -> None:
+    set_setting("daily_prize_limit", str(max(0, min(100, limit))))
+
+
+def average_regular_prize_stars() -> float:
+    total_units = sum(REGULAR_PRIZE_WEIGHTS.values())
+    if total_units <= 0:
+        return 20.0
+    weighted_sum = sum(stars * count for stars, count in REGULAR_PRIZE_WEIGHTS.items())
+    return weighted_sum / total_units
+
+
+def estimate_monthly_stars_spend(daily_limit: int) -> tuple[int, float]:
+    now = datetime.now(APP_TZ)
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    avg_stars = average_regular_prize_stars()
+    estimate = daily_limit * days_in_month * avg_stars
+    return days_in_month, estimate
 
 
 def should_send_daily_limit_notice(chat_id: int, day_key: str, cooldown_min: int) -> bool:
@@ -586,7 +700,7 @@ def save_successful_claim(
     stars: int,
 ) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        inserted = conn.execute(
+        conn.execute(
             """
             INSERT OR IGNORE INTO daily_claims (
                 chat_id, day_key, user_id, winner_name, attempt_no, claimed_stars, created_at
@@ -595,10 +709,15 @@ def save_successful_claim(
             """,
             (chat_id, day_key, user_id, winner_name, attempt_no, stars, datetime.now(timezone.utc).isoformat()),
         )
-        # If claim already exists, don't mutate monthly counters and signal caller.
-        if inserted.rowcount == 0:
-            conn.commit()
-            return False
+        conn.execute(
+            """
+            INSERT INTO daily_claim_events (
+                chat_id, day_key, month_key, user_id, winner_name, attempt_no, claimed_stars, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, day_key, month_key, user_id, winner_name, attempt_no, stars, datetime.now(timezone.utc).isoformat()),
+        )
         conn.execute(
             """
             INSERT INTO monthly_claims (chat_id, month_key, sent_50, sent_25, sent_15)
@@ -635,6 +754,8 @@ def save_successful_claim(
                 (chat_id, month_key),
             )
         conn.commit()
+    # Attempts are tracked per prize cycle, so reset after a successful claim.
+    reset_daily_attempt(chat_id, day_key)
     return True
 
 
@@ -845,6 +966,7 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "Статус бота",
         f"- Баланс бота: {balance_text} Stars",
+        f"- DAILY_PRIZE_LIMIT: {get_daily_prize_limit()}",
         f"- AUTO_TOPUP_ENABLED: {1 if auto_enabled else 0}",
         f"- AUTO_TOPUP_THRESHOLD: {threshold}",
         f"- AUTO_TOPUP_AMOUNT: {amount}",
@@ -867,18 +989,16 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("- Групи у whitelist:")
         for chat_id in allowed:
             month_state = get_month_state(chat_id, month_key)
-            left_50 = max(0, MONTHLY_QUOTAS[50] - month_state.sent_50)
-            left_25 = max(0, MONTHLY_QUOTAS[25] - month_state.sent_25)
-            left_15 = max(0, MONTHLY_QUOTAS[15] - month_state.sent_15)
             attempts_today = get_daily_attempt(chat_id, day_key)
+            sent_today = count_daily_claims(chat_id, day_key)
             claim = get_daily_claim(chat_id, day_key)
             if claim:
                 winner_text = f"{claim.winner_name or f'ID {claim.user_id}'} (спроба #{claim.attempt_no})"
             else:
                 winner_text = "ще не було"
             lines.append(
-                f"  {chat_id}: залишок 50/25/15 = {left_50}/{left_25}/{left_15}, "
-                f"спроб сьогодні = {attempts_today}, переможець = {winner_text}"
+                f"  {chat_id}: видано за місяць 50/25/15 = {month_state.sent_50}/{month_state.sent_25}/{month_state.sent_15}, "
+                f"спроб сьогодні = {attempts_today}, видано сьогодні = {sent_today}, останній переможець = {winner_text}"
             )
 
     await message.reply_text("\n".join(lines))
@@ -1244,15 +1364,61 @@ async def on_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         target_day_key, _ = current_keys()
     target_month_key = target_day_key[:7]
 
-    removed, claimed_stars = reset_daily_claim(target_chat_id, target_day_key, target_month_key)
+    removed, rollback_50, rollback_25, rollback_15 = reset_daily_claim(target_chat_id, target_day_key, target_month_key)
     if not removed:
         await message.reply_text(f"На {target_day_key} для чату {target_chat_id} прапорця переможця не було.")
         return
 
     await message.reply_text(
         f"Скинуто денний прапорець для чату {target_chat_id} на {target_day_key}.\n"
-        f"Місячний лічильник відкотили на категорію: {claimed_stars} Stars."
+        f"Місячний лічильник відкотили: 50={rollback_50}, 25={rollback_25}, 15={rollback_15}."
     )
+
+
+async def on_dailylimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if resolve_stats_owner_user_id() is None and os.getenv("STATS_OWNER_USER_ID", "").strip():
+        await message.reply_text("STATS_OWNER_USER_ID має бути числом.")
+        return
+    if not is_stats_owner(user.id):
+        return
+
+    if context.args:
+        try:
+            new_limit = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Формат: /dailylimit [0..100]. Приклад: /dailylimit 2")
+            return
+        if new_limit < 0 or new_limit > 100:
+            await message.reply_text("Ліміт має бути в діапазоні 0..100.")
+            return
+        set_daily_prize_limit(new_limit)
+        logger.info("Daily prize limit updated by owner: %s", new_limit)
+
+    limit = get_daily_prize_limit()
+    day_key, _ = current_keys()
+    days_in_month, monthly_estimate = estimate_monthly_stars_spend(limit)
+    avg_stars = average_regular_prize_stars()
+    lines = [f"Денний ліміт призів: {limit} (0 = вимкнути видачу).", f"Сьогодні ({day_key}) по групах:"]
+    allowed = sorted(allowed_chat_ids())
+    if not allowed:
+        lines.append("- ALLOWED_CHAT_IDS порожній.")
+    else:
+        for chat_id in allowed:
+            sent = count_daily_claims(chat_id, day_key)
+            lines.append(f"- {chat_id}: {sent}/{limit}")
+    lines.append(
+        f"Оцінка витрат на місяць: ~{monthly_estimate:.1f} Stars "
+        f"(днів={days_in_month}, середній приз={avg_stars:.2f})."
+    )
+    lines.append("Примітка: оцінка не включає NFT-призи.")
+    await message.reply_text("\n".join(lines))
 
 
 async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1517,13 +1683,13 @@ async def deliver_gift_like_win(
         if is_announced_flow:
             nft_title = resolve_nft_title(normalized_gift_id) if normalized_gift_id else None
             await message.reply_text(
-                f"✅ Є переможець дня: {winner_name}. "
+                f"✅ Є переможець: {winner_name}. "
                 f"Спроба: {attempt_no}.\n"
                 + (f"Випав приз: {nft_title} 🎉" if nft_title else "Випав приз 🎉")
             )
         else:
             await message.reply_text(
-                f"✅ Є переможець дня: {winner_name}. "
+                f"✅ Є переможець: {winner_name}. "
                 f"Спроба: {attempt_no}.\n"
                 f"Випав приз за {actual_stars} Stars 🎉"
             )
@@ -1594,10 +1760,13 @@ async def on_teststicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-def pick_stars_by_remaining(state: GroupMonthState) -> int | None:
-    bag = state.remaining_units()
+def pick_regular_stars_tier() -> int:
+    bag: list[int] = []
+    for stars, weight in REGULAR_PRIZE_WEIGHTS.items():
+        if weight > 0:
+            bag.extend([stars] * weight)
     if not bag:
-        return None
+        return 15
     return random.choice(bag)
 
 
@@ -1657,20 +1826,25 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     winner_name = user.full_name or "Переможець"
     winner_username = user.username
     daily_limit_text = DEFAULT_DAILY_LIMIT_TEXT
-    monthly_limit_text = DEFAULT_MONTHLY_LIMIT_TEXT
+    daily_prize_limit = get_daily_prize_limit()
 
     async with CLAIM_LOCK:
         current_attempt_no = increment_daily_attempt(chat_id, day_key)
 
-        if has_daily_claim(chat_id, day_key):
+        claims_today = count_daily_claims(chat_id, day_key)
+        if claims_today >= daily_prize_limit:
             claim = get_daily_claim(chat_id, day_key)
             if claim:
                 winner_label = claim.winner_name or f"ID {claim.user_id}"
                 await message.reply_text(
-                    f"{daily_limit_text}\nПереможець дня: {winner_label} (спроба {claim.attempt_no})."
+                    f"{daily_limit_text}\nЛіміт на сьогодні: {daily_prize_limit}. "
+                    f"Вже видано: {claims_today}.\n"
+                    f"Останній переможець: {winner_label} (спроба {claim.attempt_no})."
                 )
             else:
-                await message.reply_text(daily_limit_text)
+                await message.reply_text(
+                    f"{daily_limit_text}\nЛіміт на сьогодні: {daily_prize_limit}. Вже видано: {claims_today}."
+                )
             return
 
         if message.dice.value not in WINNING_SLOT_VALUES:
@@ -1736,11 +1910,7 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             nft_probability,
         )
 
-        month_state = get_month_state(chat_id, month_key)
-        stars_tier = pick_stars_by_remaining(month_state)
-        if stars_tier is None:
-            await message.reply_text(monthly_limit_text)
-            return
+        stars_tier = pick_regular_stars_tier()
 
         try:
             await deliver_gift_like_win(
@@ -1773,6 +1943,7 @@ def build_app() -> Application:
     app.add_handler(TypeHandler(Update, on_any_update, block=False), group=-1)
     app.add_handler(CommandHandler("ids", on_ids))
     app.add_handler(CommandHandler("stats", on_stats, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("dailylimit", on_dailylimit, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("topup", on_topup, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("buy", on_buy, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("teststicker", on_teststicker, filters=filters.ChatType.PRIVATE))
