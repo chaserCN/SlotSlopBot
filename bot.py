@@ -587,7 +587,9 @@ def save_monthly_nft_claim(
 
 def month_draws_left(now: datetime) -> int:
     _, days_in_month = calendar.monthrange(now.year, now.month)
-    return max(1, days_in_month - now.day + 1)
+    days_left = max(1, days_in_month - now.day + 1)
+    daily_limit = max(1, get_daily_prize_limit())
+    return days_left * daily_limit
 
 
 def pick_monthly_nft_gift(month_key: str) -> tuple[str | None, int, int, float]:
