@@ -46,13 +46,20 @@ REGULAR_PRIZE_WEIGHTS = {
     25: 6,
     15: 22,
 }
+DEFAULT_VALENTINE_50_GIFT_IDS = (
+    "5800655655995968830",  # 🎁
+    "5801108895304779062",  # 🎁
+)
 
 DEFAULT_DAILY_LIMIT_TEXT = "Сьогоднішній ліміт вичерпано: призи на сьогодні вже розіграно."
 DEFAULT_DAILY_PRIZE_LIMIT = 1
 DEFAULT_AUTO_TOPUP_THRESHOLD = 100
 DEFAULT_AUTO_TOPUP_AMOUNT = 615
-# Slot dice values for three identical symbols (BAR/Berries/Lemon/7).
-WINNING_SLOT_VALUES = {1, 22, 43, 64}
+# Telegram 🎰 dice.value encodes 3 reels x 4 symbols (total 64 outcomes).
+# We treat "win" as: any triple OR any two 7s.
+SLOT_SYMBOLS = 4
+SLOT_REELS = 3
+SLOT_SEVEN_SYMBOL = 3
 DB_PATH = Path(os.getenv("DB_PATH", "gift_state.sqlite3"))
 API_BASE = "https://api.telegram.org"
 CLAIM_LOCK = asyncio.Lock()
@@ -498,6 +505,65 @@ def parse_bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def decode_slot_value(value: int) -> tuple[int, int, int] | None:
+    # Mapping assumption:
+    # value in 1..64 corresponds to base-4 digits of (value - 1), one digit per reel.
+    if not isinstance(value, int) or value < 1 or value > SLOT_SYMBOLS**SLOT_REELS:
+        return None
+    x = value - 1
+    a = x // 16
+    b = (x // 4) % 4
+    c = x % 4
+    return a, b, c
+
+
+def is_winning_slot_value(value: int) -> bool:
+    symbols = decode_slot_value(value)
+    if not symbols:
+        return False
+    a, b, c = symbols
+    if a == b == c:
+        return True
+    seven_count = int(a == SLOT_SEVEN_SYMBOL) + int(b == SLOT_SEVEN_SYMBOL) + int(c == SLOT_SEVEN_SYMBOL)
+    return seven_count >= 2
+
+
+def parse_id_list_env(name: str, default: tuple[str, ...]) -> list[str]:
+    raw = os.getenv(name, "")
+    result: list[str] = []
+    seen: set[str] = set()
+    chunks = raw.split(",") if raw else list(default)
+    for chunk in chunks:
+        item = chunk.strip()
+        if not item or not item.isdigit() or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def is_valentine_day(now: datetime | None = None) -> bool:
+    current = now or datetime.now(APP_TZ)
+    return current.month == 2 and current.day == 14
+
+
+def valentine_50_gift_ids() -> list[str]:
+    return parse_id_list_env("VALENTINE_50_GIFT_IDS", DEFAULT_VALENTINE_50_GIFT_IDS)
+
+
+def pick_preferred_50_gift_id(gifts: list[dict[str, Any]], preferred_ids: list[str]) -> str | None:
+    available_50_ids: set[str] = set()
+    for gift in gifts:
+        gift_id = gift.get("id")
+        if gift.get("star_count") == 50 and gift_id is not None:
+            available_50_ids.add(str(gift_id))
+
+    candidates = [gift_id for gift_id in preferred_ids if gift_id in available_50_ids]
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
 def parse_monthly_nft_pool() -> list[NftPoolItem]:
@@ -1812,7 +1878,8 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message.dice.emoji != "🎰":
         return
 
-    day_key, month_key = current_keys()
+    now_local = datetime.now(APP_TZ)
+    day_key, month_key = now_local.strftime("%Y-%m-%d"), now_local.strftime("%Y-%m")
     chat_id = chat.id
     user_id = user.id
 
@@ -1849,8 +1916,34 @@ async def on_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             return
 
-        if message.dice.value not in WINNING_SLOT_VALUES:
+        if not is_winning_slot_value(message.dice.value):
             return
+
+        if is_valentine_day(now_local):
+            try:
+                gifts = await get_available_gifts(token)
+                preferred_gift_id = pick_preferred_50_gift_id(gifts, valentine_50_gift_ids())
+                await deliver_gift_like_win(
+                    message,
+                    context,
+                    token=token,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    winner_name=winner_name,
+                    winner_username=winner_username,
+                    attempt_no=current_attempt_no,
+                    day_key=day_key,
+                    month_key=month_key,
+                    stars_tier=50,
+                    persist_claim=True,
+                    notify_owner=True,
+                    announced_gift_id=preferred_gift_id,
+                )
+                return
+            except Exception as err:
+                logger.exception("Failed to send Valentine gift: %s", err)
+                await message.reply_text(f"Помилка під час обробки Valentine-подарунка: {err}")
+                return
 
         selected_nft_gift_id, nft_left, draws_left, nft_probability = pick_monthly_nft_gift(month_key)
         if selected_nft_gift_id:
