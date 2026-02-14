@@ -507,6 +507,11 @@ def parse_bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def is_dry_run() -> bool:
+    # DRY_RUN=1 disables side effects like notifying the payer/owner about winners.
+    return parse_bool_env("DRY_RUN", False)
+
+
 def decode_slot_value(value: int) -> tuple[int, int, int] | None:
     # Mapping assumption:
     # value in 1..64 corresponds to base-4 digits of (value - 1), one digit per reel.
@@ -1516,6 +1521,8 @@ async def notify_winner_to_owner(
     stars_tier: int,
     gift: dict[str, Any],
 ) -> None:
+    if is_dry_run():
+        return
     if not parse_bool_env("WINNER_NOTIFY_ENABLED", True):
         return
 
